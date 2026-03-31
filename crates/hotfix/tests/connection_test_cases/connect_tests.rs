@@ -6,7 +6,7 @@
 use crate::helpers::{
     MinimalApplication, MinimalMessage, TestCertificates, TestTcpServer, TestTlsServer,
 };
-use hotfix::config::{SessionConfig, TlsConfig};
+use hotfix::config::{SessionConfig, TlsConfig, VerificationConfig};
 use hotfix::session::InternalSessionRef;
 use hotfix::store::in_memory::InMemoryMessageStore;
 use hotfix::transport::socket::connect;
@@ -26,6 +26,7 @@ fn create_session_config(host: &str, port: u16, tls_config: Option<TlsConfig>) -
         reconnect_interval: 30,
         reset_on_logon: false,
         schedule: None,
+        verification: VerificationConfig::default(),
     }
 }
 

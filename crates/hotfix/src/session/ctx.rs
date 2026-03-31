@@ -3,6 +3,7 @@ use hotfix_message::message::Config as MessageConfig;
 use hotfix_store::MessageStore;
 
 use crate::config::SessionConfig;
+use crate::config::VerificationConfig;
 use crate::message::OutboundMessage;
 use crate::message::generate_message;
 use crate::message::parser::RawFixMessage;
@@ -87,5 +88,9 @@ impl<A, S: MessageStore> SessionCtx<A, S> {
             seq_num,
             raw: RawFixMessage::new(msg),
         })
+    }
+
+    pub fn verification_config(&self) -> &VerificationConfig {
+        &self.config.verification
     }
 }

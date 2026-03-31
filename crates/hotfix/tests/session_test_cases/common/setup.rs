@@ -3,7 +3,7 @@ use crate::common::assertions::then;
 use crate::common::fakes::{FakeApplication, FakeCounterparty, SessionSpy};
 use crate::common::test_messages::TestMessage;
 use crate::session_test_cases::common::fakes::DisconnectedSession;
-use hotfix::config::SessionConfig;
+use hotfix::config::{SessionConfig, VerificationConfig};
 use hotfix::session::InternalSessionRef;
 use hotfix::session::Status;
 use hotfix::store::in_memory::InMemoryMessageStore;
@@ -119,6 +119,7 @@ pub fn create_session_config() -> SessionConfig {
         reconnect_interval: 30,
         reset_on_logon: false,
         schedule: None,
+        verification: VerificationConfig::default(),
     }
 }
 
