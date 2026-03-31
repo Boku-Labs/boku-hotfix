@@ -208,7 +208,7 @@ where
             .get(MSG_TYPE)
             .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?;
 
-        let flags = VerificationFlags::for_message(&message)?;
+        let flags = VerificationFlags::for_message(&message, self.ctx.verification_config())?;
         if let VerificationResult::Issue(result) = self
             .state
             .handle_verification_issue(&mut self.ctx, &message, flags)
@@ -755,6 +755,7 @@ async fn run_session<App, Store>(
 mod tests {
     use super::*;
     use crate::application::{InboundDecision, OutboundDecision};
+    use crate::config::VerificationConfig;
     use crate::message::OutboundMessage;
     use crate::store::{Result as StoreResult, StoreError};
     use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Timelike};
@@ -891,6 +892,7 @@ mod tests {
             reconnect_interval: 30,
             reset_on_logon: false,
             schedule: None,
+            verification: VerificationConfig::default(),
         }
     }
 

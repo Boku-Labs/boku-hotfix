@@ -114,6 +114,30 @@ pub struct SessionConfig {
 
     /// The schedule configuration for the session
     pub schedule: Option<ScheduleConfig>,
+
+    /// The validation configuration for the session
+    #[serde(default)]
+    pub verification: VerificationConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+/// The configuration of validation rules.
+pub struct VerificationConfig {
+    /// Specifies whether we should check the original sending time for admin messages.
+    #[serde(default = "default_true")]
+    pub check_orig_sending_time_for_admin: bool,
+}
+
+impl Default for VerificationConfig {
+    fn default() -> Self {
+        Self {
+            check_orig_sending_time_for_admin: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Errors that may occur when loading configuration.
@@ -170,6 +194,11 @@ reset_on_logon = false
         assert_eq!(session_config.tls_config, Some(expected_tls_config));
         assert_eq!(session_config.reconnect_interval, 30);
         assert_eq!(session_config.logon_timeout, 10);
+        assert!(
+            session_config
+                .verification
+                .check_orig_sending_time_for_admin
+        );
     }
 
     #[test]
@@ -437,6 +466,53 @@ end_day = "Friday"
 
         let session_config = config.sessions.first().unwrap();
         assert_eq!(session_config.reconnect_interval, 15);
+    }
+
+    #[test]
+    fn test_verification_config_defaults_when_omitted() {
+        let config_contents = r#"
+[[sessions]]
+begin_string = "FIX.4.4"
+sender_comp_id = "send-comp-id"
+target_comp_id = "target-comp-id"
+connection_port = 443
+connection_host = "127.0.0.1"
+heartbeat_interval = 30
+        "#;
+
+        let config: Config = toml::from_str(config_contents).unwrap();
+        let session_config = config.sessions.first().unwrap();
+
+        assert!(
+            session_config
+                .verification
+                .check_orig_sending_time_for_admin
+        );
+    }
+
+    #[test]
+    fn test_verification_config_can_disable_admin_orig_sending_time_check() {
+        let config_contents = r#"
+[[sessions]]
+begin_string = "FIX.4.4"
+sender_comp_id = "send-comp-id"
+target_comp_id = "target-comp-id"
+connection_port = 443
+connection_host = "127.0.0.1"
+heartbeat_interval = 30
+
+[sessions.verification]
+check_orig_sending_time_for_admin = false
+        "#;
+
+        let config: Config = toml::from_str(config_contents).unwrap();
+        let session_config = config.sessions.first().unwrap();
+
+        assert!(
+            !session_config
+                .verification
+                .check_orig_sending_time_for_admin
+        );
     }
 
     #[test]
