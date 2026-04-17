@@ -157,7 +157,6 @@ async fn establish_connection<Outbound: OutboundMessage>(
 mod tests {
     use super::*;
     use crate::application::{Application, InboundDecision, OutboundDecision};
-    use crate::config::VerificationConfig;
     use crate::message::generate_message;
     use crate::message::logon::{Logon, ResetSeqNumConfig};
     use crate::message::logout::Logout;
@@ -300,7 +299,6 @@ mod tests {
             reconnect_interval: 1, // Short for tests
             reset_on_logon: false,
             schedule: None,
-            verification: VerificationConfig::default(),
         }
     }
 

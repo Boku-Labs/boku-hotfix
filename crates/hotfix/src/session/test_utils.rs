@@ -1,4 +1,4 @@
-use crate::config::{SessionConfig, VerificationConfig};
+use crate::config::SessionConfig;
 use crate::session::ctx::SessionCtx;
 use crate::store::{MessageStore, Result as StoreResult};
 use crate::transport::writer::{WriterMessage, WriterRef};
@@ -87,7 +87,6 @@ pub(crate) fn create_test_ctx(store: FakeMessageStore) -> SessionCtx<(), FakeMes
             reconnect_interval: 30,
             reset_on_logon: false,
             schedule: None,
-            verification: VerificationConfig::default(),
         },
         store,
         application: (),
