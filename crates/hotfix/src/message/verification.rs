@@ -1,9 +1,9 @@
-use crate::config::{SessionConfig, VerificationConfig};
+use crate::config::SessionConfig;
+use crate::message::ResendRequest;
 use crate::message::logout::Logout;
 use crate::message::reject::Reject;
 use crate::message::sequence_reset::SequenceReset;
 use crate::message::verification_issue::{CompIdType, MessageError, VerificationIssue};
-use crate::message::{ResendRequest, is_admin};
 use crate::session::error::SessionOperationError;
 use hotfix_message::Part;
 use hotfix_message::field_types::Timestamp;
@@ -22,7 +22,6 @@ const SENDING_TIME_THRESHOLD: u64 = 120;
 pub(crate) struct VerificationFlags {
     pub(crate) check_too_high: bool,
     pub(crate) check_too_low: bool,
-    #[allow(dead_code)]
     pub(crate) check_orig_sending_time: bool,
 }
 
@@ -43,21 +42,13 @@ impl VerificationFlags {
         self.check_too_high || self.check_too_low
     }
 
-    pub(crate) fn for_message(
-        message: &Message,
-        user_config: &VerificationConfig,
-    ) -> Result<Self, SessionOperationError> {
+    pub(crate) fn for_message(message: &Message) -> Result<Self, SessionOperationError> {
         let message_type: &str = message
             .header()
             .get(MSG_TYPE)
             .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?;
 
         let possible_duplicate = message.header().get::<bool>(POSS_DUP_FLAG).unwrap_or(false);
-        let check_orig_sending_time = if is_admin(message_type) {
-            possible_duplicate && user_config.check_orig_sending_time_for_admin
-        } else {
-            possible_duplicate
-        };
 
         let flags = match message_type {
             // check_too_high=false: QFJ-673 deadlock fix. When both sides send
@@ -65,14 +56,14 @@ impl VerificationFlags {
             // number higher than expected. By not treating that as an error, we allow
             // the ResendRequest to be processed.
             ResendRequest::MSG_TYPE | Reject::MSG_TYPE => {
-                Self::new(false, true, check_orig_sending_time)
+                Self::new(false, true, possible_duplicate)
             }
-            Logout::MSG_TYPE => Self::new(false, false, check_orig_sending_time),
+            Logout::MSG_TYPE => Self::new(false, false, possible_duplicate),
             SequenceReset::MSG_TYPE => {
                 let is_gap_fill: bool = message.get(GAP_FILL_FLAG).unwrap_or(false);
-                Self::new(is_gap_fill, is_gap_fill, check_orig_sending_time)
+                Self::new(is_gap_fill, is_gap_fill, false)
             }
-            _ => Self::new(true, true, check_orig_sending_time),
+            _ => Self::new(true, true, possible_duplicate),
         };
 
         Ok(flags)
@@ -246,8 +237,8 @@ fn check_target_comp_id(
 
 #[cfg(test)]
 mod tests {
-    use super::{Message, SessionConfig, VerificationConfig, VerificationFlags, verify_message};
-    use crate::message::heartbeat::Heartbeat;
+    use super::{Message, SessionConfig, VerificationFlags, verify_message};
+    use crate::message::sequence_reset::SequenceReset;
     use crate::message::verification_issue::{CompIdType, MessageError, VerificationIssue};
     use hotfix_message::field_types::Timestamp;
     use hotfix_message::{Part, fix44};
@@ -267,7 +258,6 @@ mod tests {
             reconnect_interval: 0,
             reset_on_logon: false,
             schedule: None,
-            verification: VerificationConfig::default(),
         }
     }
 
@@ -296,48 +286,39 @@ mod tests {
     }
 
     #[test]
-    fn test_creating_flags_for_admin_message_should_check_orig_sending_time_when_enabled() {
-        let mut msg =
-            build_test_message_with_type("FIX.4.4", Heartbeat::MSG_TYPE, "TARGET", "SENDER", 42);
-        msg.header_mut().set(fix44::POSS_DUP_FLAG, true);
+    fn test_creating_flags_for_gap_fill_message_should_skip_check_orig_sending_time() {
+        let msg = build_test_message_with_type(
+            "FIX.4.4",
+            SequenceReset::MSG_TYPE,
+            "TARGET",
+            "SENDER",
+            42,
+        );
 
-        let flags = VerificationFlags::for_message(&msg, &VerificationConfig::default()).unwrap();
+        let flags = VerificationFlags::for_message(&msg).unwrap();
 
-        assert!(flags.check_orig_sending_time);
-        assert!(flags.check_too_high);
-        assert!(flags.check_too_low);
+        assert!(!flags.check_orig_sending_time);
+        assert!(!flags.check_too_high);
+        assert!(!flags.check_too_low);
     }
 
     #[test]
-    fn test_creating_flags_for_admin_message_should_skip_check_orig_sending_time_when_not_poss_dup()
-    {
-        let msg =
-            build_test_message_with_type("FIX.4.4", Heartbeat::MSG_TYPE, "TARGET", "SENDER", 42);
-
-        let flags = VerificationFlags::for_message(&msg, &VerificationConfig::default()).unwrap();
-
-        assert!(!flags.check_orig_sending_time);
-        assert!(flags.check_too_high);
-        assert!(flags.check_too_low);
-    }
-
-    #[test]
-    fn test_creating_flags_for_admin_message_should_skip_check_orig_sending_time_when_disabled() {
-        let mut msg =
-            build_test_message_with_type("FIX.4.4", Heartbeat::MSG_TYPE, "TARGET", "SENDER", 42);
+    fn test_creating_flags_for_gap_fill_message_should_skip_check_orig_sending_time_even_for_poss_duplicate()
+     {
+        let mut msg = build_test_message_with_type(
+            "FIX.4.4",
+            SequenceReset::MSG_TYPE,
+            "TARGET",
+            "SENDER",
+            42,
+        );
         msg.header_mut().set(fix44::POSS_DUP_FLAG, true);
 
-        let flags = VerificationFlags::for_message(
-            &msg,
-            &VerificationConfig {
-                check_orig_sending_time_for_admin: false,
-            },
-        )
-        .unwrap();
+        let flags = VerificationFlags::for_message(&msg).unwrap();
 
         assert!(!flags.check_orig_sending_time);
-        assert!(flags.check_too_high);
-        assert!(flags.check_too_low);
+        assert!(!flags.check_too_high);
+        assert!(!flags.check_too_low);
     }
 
     #[test]
@@ -345,13 +326,7 @@ mod tests {
         let mut msg = build_test_message("FIX.4.4", "TARGET", "SENDER", 42);
         msg.header_mut().set(fix44::POSS_DUP_FLAG, true);
 
-        let flags = VerificationFlags::for_message(
-            &msg,
-            &VerificationConfig {
-                check_orig_sending_time_for_admin: false,
-            },
-        )
-        .unwrap();
+        let flags = VerificationFlags::for_message(&msg).unwrap();
 
         assert!(flags.check_orig_sending_time);
         assert!(flags.check_too_high);
@@ -362,13 +337,7 @@ mod tests {
     fn test_creating_flags_for_app_messages_skip_orig_sending_time_when_it_is_not_poss_dup() {
         let msg = build_test_message("FIX.4.4", "TARGET", "SENDER", 42);
 
-        let flags = VerificationFlags::for_message(
-            &msg,
-            &VerificationConfig {
-                check_orig_sending_time_for_admin: true,
-            },
-        )
-        .unwrap();
+        let flags = VerificationFlags::for_message(&msg).unwrap();
 
         assert!(!flags.check_orig_sending_time);
         assert!(flags.check_too_high);

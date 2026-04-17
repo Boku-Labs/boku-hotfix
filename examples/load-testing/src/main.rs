@@ -3,7 +3,7 @@ mod messages;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use hotfix::config::{SessionConfig, VerificationConfig};
+use hotfix::config::SessionConfig;
 use hotfix::field_types::{Date, Timestamp};
 use hotfix::fix44;
 use hotfix::fix44::OrdType;
@@ -168,6 +168,5 @@ fn get_config() -> SessionConfig {
         reconnect_interval: 30,
         reset_on_logon: true,
         schedule: None,
-        verification: VerificationConfig::default(),
     }
 }
