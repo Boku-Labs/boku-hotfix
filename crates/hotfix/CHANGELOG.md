@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.11.2...hotfix-v0.12.0) - 2026-04-24
+
+### Fixed
+
+- prevent sessions from hanging due to lack of explicit shutdown and safeguards for TCP connection ([#347](https://github.com/Validus-Risk-Management/hotfix/pull/347))
+- propagate shutdown response from schedule calculations ([#346](https://github.com/Validus-Risk-Management/hotfix/pull/346))
+
+## [0.11.2](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.11.1...hotfix-v0.11.2) - 2026-04-23
+
+### Added
+
+- admin operation to set the next expected target sequence number ([#342](https://github.com/Validus-Risk-Management/hotfix/pull/342))
+
+## [0.11.1](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.11.0...hotfix-v0.11.1) - 2026-04-20
+
+### Added
+
+- add validation config and provide ability to disable orig sent time for admin messages ([#334](https://github.com/Validus-Risk-Management/hotfix/pull/334))
+
+### Other
+
+- remove remaining pattern matching in session code ([#330](https://github.com/Validus-Risk-Management/hotfix/pull/330))
+
 ### Added
  - skip check for original sending time(tag 122) in sequence reset messages ([#322](https://github.com/Validus-Risk-Management/hotfix/pull/334))
 
