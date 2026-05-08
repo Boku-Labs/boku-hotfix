@@ -185,6 +185,27 @@ where
                         }
                     }
                 }
+                InvalidReason::RequiredFieldMissing { tag, group_tag } => {
+                    match message.header().get(MSG_SEQ_NUM) {
+                        Ok(msg_seq_num) => {
+                            let text = match group_tag {
+                                Some(group_tag) => {
+                                    format!("required tag missing: {tag} (in group {group_tag})")
+                                }
+                                None => format!("required tag missing: {tag}"),
+                            };
+                            let reject = Reject::new(msg_seq_num)
+                                .session_reject_reason(SessionRejectReason::RequiredTagMissing)
+                                .text(&text);
+                            self.send_message(reject)
+                                .await
+                                .with_send_context("reject for missing required field")?;
+                        }
+                        Err(err) => {
+                            error!("failed to get message seq num: {:?}", err);
+                        }
+                    }
+                }
             },
             ParsedMessage::UnexpectedError(err) => {
                 error!("unexpected error: {:?}", err);
