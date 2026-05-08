@@ -214,6 +214,7 @@ impl MessageBuilder {
                             field_def.tag(),
                             ParentScope::Message(message_def),
                         )?;
+                        Self::check_required_fields_in_groups(&groups, group_def)?;
                         body.set_groups(groups).map_err(|err| {
                             ParserError::Malformed(format!(
                                 "failed to set groups for tag {}: {err}",
@@ -386,6 +387,32 @@ impl MessageBuilder {
         }
     }
 
+    fn check_required_fields_in_groups(
+        groups: &[RepeatingGroup],
+        group_def: &GroupSpecification,
+    ) -> ParserResult<()> {
+        let group_tag = group_def.number_of_entries_tag().get();
+        for entry in groups {
+            let field_map = entry.get_fields();
+
+            for field_def in group_def.fields() {
+                if field_def.is_required && !field_map.fields.contains_key(&field_def.tag) {
+                    return Err(ParserError::RequiredFieldMissing {
+                        tag: field_def.tag.get(),
+                        group_tag: Some(group_tag),
+                    });
+                }
+            }
+
+            for (nested_tag, nested_spec) in &group_def.nested_groups {
+                if let Some(nested_entries) = field_map.groups.get(nested_tag) {
+                    Self::check_required_fields_in_groups(nested_entries, nested_spec)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn get_dict_field_by_tag(&self, tag: u32) -> ParserResult<hotfix_dictionary::Field<'_>> {
         self.dict
             .field_by_tag(tag)
@@ -495,22 +522,19 @@ fn parser_error_to_parsed_message(err: ParserError, header: Header) -> ParsedMes
             reason: InvalidReason::InvalidMsgType(msg_type),
             message: Message::with_header(header),
         },
+        ParserError::RequiredFieldMissing { tag, group_tag } => ParsedMessage::Invalid {
+            reason: InvalidReason::RequiredFieldMissing { tag, group_tag },
+            message: Message::with_header(header),
+        },
         ParserError::Malformed(_) => ParsedMessage::Garbled(GarbledReason::Malformed),
     }
 }
 
 struct FieldSpecification {
     pub(crate) tag: TagU32,
-    #[allow(dead_code)]
     pub(crate) is_required: bool,
 }
 
-/// The enclosing scope of a repeating-group parse.
-///
-/// When a tag is encountered that does not belong to the group currently being
-/// parsed, the parser uses the parent scope to decide whether the tag closes
-/// the group (because it is recognised by the enclosing scope) or whether it
-/// should be treated as part of the current group / rejected.
 #[derive(Clone, Copy)]
 enum ParentScope<'a> {
     Message(&'a MessageSpecification),
@@ -1143,5 +1167,81 @@ mod tests {
 
         let party_b = message.get_group(fix44::NO_PARTY_I_DS, 1).unwrap();
         assert_eq!(party_b.get::<&str>(fix44::PARTY_ID).unwrap(), "PARTYB");
+    }
+
+    #[test]
+    fn test_group_entry_missing_required_field_is_rejected() {
+        let dict = Dictionary::fix44();
+        let builder = MessageBuilder::new(dict, CONFIG).unwrap();
+
+        // Find any (msg_type, group, required-non-delim-field) combination so
+        // we can construct a minimal message that's structurally well-formed
+        // except for the missing group field.
+        let candidate = builder
+            .message_specification
+            .iter()
+            .find_map(|(msg_type, message_def)| {
+                message_def
+                    .groups
+                    .iter()
+                    .find_map(|(group_tag, group_spec)| {
+                        let required_non_delim = group_spec
+                            .fields()
+                            .iter()
+                            .find(|f| f.is_required && f.tag != group_spec.delimiter_tag())?;
+                        Some((
+                            msg_type.clone(),
+                            group_tag.get(),
+                            group_spec.delimiter_tag().get(),
+                            required_non_delim.tag.get(),
+                        ))
+                    })
+            });
+
+        let Some((msg_type, group_tag, delimiter_tag, missing_tag)) = candidate else {
+            // The dictionary has no group with a required non-delimiter field.
+            return;
+        };
+
+        let body = format!(
+            "35={msg_type}|49=S|56=T|34=1|52=20231103-12:00:00|{group_tag}=1|{delimiter_tag}=X|"
+        );
+        let raw = build_pipe_separated_message(&body);
+        let parsed = builder.build(&raw);
+
+        match parsed {
+            ParsedMessage::Invalid {
+                reason:
+                    InvalidReason::RequiredFieldMissing {
+                        tag,
+                        group_tag: Some(g),
+                    },
+                ..
+            } => {
+                assert_eq!(tag, missing_tag);
+                assert_eq!(g, group_tag);
+            }
+            other => panic!(
+                "expected RequiredFieldMissing(tag={missing_tag}, group_tag={group_tag}); \
+                 msg_type={msg_type}, delimiter={delimiter_tag}, got: {}",
+                match &other {
+                    ParsedMessage::Valid(_) => "Valid".to_string(),
+                    ParsedMessage::Invalid { reason, .. } => match reason {
+                        InvalidReason::InvalidField(t) => format!("InvalidField({t})"),
+                        InvalidReason::InvalidGroup(t) => format!("InvalidGroup({t})"),
+                        InvalidReason::InvalidOrderInGroup { tag, group_tag } => {
+                            format!("InvalidOrderInGroup(tag={tag}, group_tag={group_tag})")
+                        }
+                        InvalidReason::InvalidComponent(s) => format!("InvalidComponent({s})"),
+                        InvalidReason::InvalidMsgType(s) => format!("InvalidMsgType({s})"),
+                        InvalidReason::RequiredFieldMissing { tag, group_tag } => {
+                            format!("RequiredFieldMissing(tag={tag}, group_tag={group_tag:?})")
+                        }
+                    },
+                    ParsedMessage::Garbled(_) => "Garbled".to_string(),
+                    ParsedMessage::UnexpectedError(_) => "UnexpectedError".to_string(),
+                }
+            ),
+        }
     }
 }
