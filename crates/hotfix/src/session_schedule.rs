@@ -385,15 +385,15 @@ fn calculate_weekly_session_bounds(
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), ScheduleError> {
     let local_datetime = datetime.with_timezone(timezone);
 
-    let days_back = {
-        let curr = local_datetime.weekday().num_days_from_monday() as i32;
-        let start = start_day.num_days_from_monday() as i32;
-        let diff = (curr - start).rem_euclid(7);
+    let days_back: u64 = {
+        let curr = local_datetime.weekday().num_days_from_monday() as i64;
+        let start = start_day.num_days_from_monday() as i64;
+        let diff = (curr - start).rem_euclid(7) as u64;
 
         if diff == 0 && local_datetime.time() < *start_time {
             7 // i.e. Monday 9 AM -> Monday 3 AM
         } else {
-            diff as u64
+            diff
         }
     };
 
