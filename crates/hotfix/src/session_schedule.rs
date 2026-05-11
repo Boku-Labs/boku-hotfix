@@ -1,4 +1,4 @@
-use crate::config::ScheduleConfig;
+use crate::config::{ScheduleConfig, SessionConfig};
 use crate::session::error::SessionCreationError;
 use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, TimeDelta, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
@@ -53,6 +53,25 @@ pub enum SessionSchedule {
         end_time: NaiveTime,
         timezone: Tz,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct ScheduleActivityChecker(SessionSchedule);
+
+impl ScheduleActivityChecker {
+    pub fn is_active_at(&self, now: &DateTime<Utc>) -> bool {
+        self.0.is_active_at(now)
+    }
+}
+
+impl TryFrom<&SessionConfig> for ScheduleActivityChecker {
+    type Error = SessionCreationError;
+
+    fn try_from(config: &SessionConfig) -> Result<Self, Self::Error> {
+        Ok(ScheduleActivityChecker(SessionSchedule::try_from(
+            config.schedule.as_ref(),
+        )?))
+    }
 }
 
 impl SessionSchedule {
@@ -1935,6 +1954,97 @@ mod tests {
         assert!(matches!(
             result,
             Err(ScheduleError::AmbiguousOrMissingTime { .. })
+        ));
+    }
+
+    fn session_config_with(schedule: Option<ScheduleConfig>) -> SessionConfig {
+        SessionConfig {
+            begin_string: "FIX.4.4".to_string(),
+            sender_comp_id: "TEST-SENDER".to_string(),
+            target_comp_id: "TEST-TARGET".to_string(),
+            data_dictionary_path: None,
+            connection_host: "127.0.0.1".to_string(),
+            connection_port: 0,
+            tls_config: None,
+            heartbeat_interval: 30,
+            logon_timeout: 10,
+            logout_timeout: 2,
+            reconnect_interval: 30,
+            reset_on_logon: false,
+            schedule,
+            validation: Default::default(),
+        }
+    }
+
+    #[test]
+    fn given_no_schedule_when_try_from_should_return_checker_always_active() {
+        // given
+        let config = session_config_with(None);
+
+        // when
+        let checker = ScheduleActivityChecker::try_from(&config).unwrap();
+
+        // then
+        assert!(checker.is_active_at(&utc_dt(2024, 1, 1, 0, 0, 0)));
+        assert!(checker.is_active_at(&utc_dt(2024, 6, 15, 12, 30, 0)));
+        assert!(checker.is_active_at(&utc_dt(2024, 12, 31, 23, 59, 59)));
+    }
+
+    #[test]
+    fn given_valid_daily_schedule_outside_window_should_return_false() {
+        // given
+        let config = session_config_with(Some(ScheduleConfig {
+            start_time: Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            end_time: Some(NaiveTime::from_hms_opt(17, 0, 0).unwrap()),
+            start_day: None,
+            end_day: None,
+            weekdays: vec![],
+            timezone: Some(Tz::UTC),
+        }));
+        let checker = ScheduleActivityChecker::try_from(&config).unwrap();
+
+        // when / then
+        assert!(!checker.is_active_at(&utc_dt(2024, 1, 1, 8, 59, 59)));
+        assert!(!checker.is_active_at(&utc_dt(2024, 1, 1, 17, 0, 0)));
+    }
+
+    #[test]
+    fn given_valid_daily_schedule_inside_window_should_return_true() {
+        // given
+        let config = session_config_with(Some(ScheduleConfig {
+            start_time: Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            end_time: Some(NaiveTime::from_hms_opt(17, 0, 0).unwrap()),
+            start_day: None,
+            end_day: None,
+            weekdays: vec![],
+            timezone: Some(Tz::UTC),
+        }));
+        let checker = ScheduleActivityChecker::try_from(&config).unwrap();
+
+        // when / then
+        assert!(checker.is_active_at(&utc_dt(2024, 1, 1, 9, 0, 0)));
+        assert!(checker.is_active_at(&utc_dt(2024, 1, 1, 13, 0, 0)));
+    }
+
+    #[test]
+    fn given_invalid_schedule_when_try_from_should_return_err() {
+        // given: start_time without end_time falls into the invalid catch-all branch
+        let config = session_config_with(Some(ScheduleConfig {
+            start_time: Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            end_time: None,
+            start_day: None,
+            end_day: None,
+            weekdays: vec![],
+            timezone: Some(Tz::UTC),
+        }));
+
+        // when
+        let result = ScheduleActivityChecker::try_from(&config);
+
+        // then
+        assert!(matches!(
+            result,
+            Err(SessionCreationError::InvalidSchedule(_))
         ));
     }
 }
