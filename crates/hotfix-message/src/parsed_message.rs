@@ -24,9 +24,18 @@ impl ParsedMessage {
 pub enum InvalidReason {
     InvalidField(u32),
     InvalidGroup(u32),
-    InvalidOrderInGroup { tag: u32, group_tag: u32 },
+    InvalidOrderInGroup {
+        tag: u32,
+        group_tag: u32,
+    },
     InvalidComponent(String),
     InvalidMsgType(String),
+    /// A required field was missing from the message body or from a repeating-group entry.
+    /// `group_tag` is `Some` when the missing field belongs to a repeating group.
+    RequiredFieldMissing {
+        tag: u32,
+        group_tag: Option<u32>,
+    },
 }
 
 #[derive(Debug)]

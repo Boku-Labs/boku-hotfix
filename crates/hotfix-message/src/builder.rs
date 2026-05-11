@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 pub const SOH: u8 = 0x1;
 
+const USER_DEFINED_TAG_MIN: u32 = 5000;
+
 /// Length of the checksum field.
 ///
 /// It should always be 7 bytes:
@@ -197,25 +199,43 @@ impl MessageBuilder {
         let mut body = Body::default();
         let mut field = next_field;
 
-        while message_def.contains_tag(field.tag) {
-            let tag = field.tag;
-            body.store_field(field);
+        loop {
+            if message_def.contains_tag(field.tag) {
+                let tag = field.tag;
+                body.store_field(field);
 
-            // check if it's the start of a group and parse the group as needed
-            let field_def = self.get_dict_field_by_tag(tag.get())?;
-            match message_def.get_group(tag) {
-                Some(group_def) => {
-                    let (groups, next) = Self::parse_groups(parser, group_def, field_def.tag())?;
-                    #[allow(clippy::expect_used)]
-                    body.set_groups(groups)
-                        .expect("groups are guaranteed to be valid at this point");
-                    field = next;
+                // check if it's the start of a group and parse the group as needed
+                let field_def = self.get_dict_field_by_tag(tag.get())?;
+                match message_def.get_group(tag) {
+                    Some(group_def) => {
+                        let (groups, next) = self.parse_groups(
+                            parser,
+                            group_def,
+                            field_def.tag(),
+                            ParentScope::Message(message_def),
+                        )?;
+                        Self::check_required_fields_in_groups(&groups, group_def)?;
+                        body.set_groups(groups).map_err(|err| {
+                            ParserError::Malformed(format!(
+                                "failed to set groups for tag {}: {err}",
+                                tag.get()
+                            ))
+                        })?;
+                        field = next;
+                    }
+                    None => {
+                        field = parser.next_field().ok_or(ParserError::Malformed(
+                            "message ended within the body".to_string(),
+                        ))?;
+                    }
                 }
-                None => {
-                    field = parser.next_field().ok_or(ParserError::Malformed(
-                        "message ended within the body".to_string(),
-                    ))?;
-                }
+            } else if self.should_accept_unknown_user_defined(field.tag) {
+                body.store_field(field);
+                field = parser.next_field().ok_or(ParserError::Malformed(
+                    "message ended within the body".to_string(),
+                ))?;
+            } else {
+                break;
             }
         }
 
@@ -224,6 +244,14 @@ impl MessageBuilder {
         }
 
         Ok((body, field))
+    }
+
+    fn should_accept_unknown_user_defined(&self, tag: TagU32) -> bool {
+        !self.config.validate_user_defined_fields && Self::is_user_defined(tag)
+    }
+
+    fn is_user_defined(tag: TagU32) -> bool {
+        tag.get() >= USER_DEFINED_TAG_MIN
     }
 
     fn build_trailer(&self, trailer: &mut Trailer, parser: &mut Parser, next_field: Field) {
@@ -238,64 +266,151 @@ impl MessageBuilder {
     }
 
     fn parse_groups(
+        &self,
         parser: &mut Parser,
         group_def: &GroupSpecification,
         start_tag: TagU32,
+        parent: ParentScope<'_>,
     ) -> ParserResult<(Vec<RepeatingGroup>, Field)> {
         let mut groups = vec![];
+        let delimiter_tag = group_def.delimiter_tag();
 
         let mut field = parser.next_field().ok_or(ParserError::Malformed(
             "missing delimiter field".to_string(),
         ))?;
-        loop {
-            let mut group = RepeatingGroup::new_with_tags(start_tag, group_def.delimiter_tag());
 
-            // we skip the first field as we've already stored the delimiter
-            for field_def in group_def.fields().iter() {
-                let is_required =
-                    field_def.is_required || field_def.tag == group_def.delimiter_tag();
-                let current_tag = field.tag;
-                if field_def.tag == current_tag {
-                    // the next tag is the next expected field's tag in the group, store it and move on
-                    group.store_field(field);
-                    field = if let Some(nested_group_def) = group_def.get_nested_group(current_tag)
-                    {
-                        let (groups, next) =
-                            Self::parse_groups(parser, nested_group_def, current_tag)?;
-                        #[allow(clippy::expect_used)]
-                        group
-                            .set_groups(groups)
-                            .expect("groups are guaranteed to be valid at this point");
-                        next
-                    } else {
-                        parser
-                            .next_field()
-                            .ok_or(ParserError::Malformed("incomplete group".to_string()))?
-                    }
-                } else if !is_required {
-                    // this field isn't required in the group, so it's fine to skip it
+        if field.tag != delimiter_tag {
+            return Err(ParserError::InvalidGroupFieldOrder {
+                tag: field.tag.get(),
+                group_tag: group_def.number_of_entries_tag().get(),
+            });
+        }
+
+        let mut current_group: Option<RepeatingGroup> = None;
+        let mut next_declared_idx: usize = 0;
+
+        loop {
+            let current_tag = field.tag;
+
+            if current_tag == delimiter_tag {
+                // delimiter starts a new group instance
+                if let Some(g) = current_group.take() {
+                    groups.push(g);
+                }
+                let mut new_group = RepeatingGroup::new_with_tags(start_tag, delimiter_tag);
+                new_group.store_field(field);
+                current_group = Some(new_group);
+                next_declared_idx = 1;
+                field = parser
+                    .next_field()
+                    .ok_or(ParserError::Malformed("incomplete group".to_string()))?;
+            } else if group_def.contains_tag(current_tag) {
+                // tag is declared in this group; enforce declaration order
+                let position = group_def
+                    .fields()
+                    .iter()
+                    .position(|f| f.tag == current_tag)
+                    .ok_or_else(|| {
+                        ParserError::Malformed(format!(
+                            "field {} reported as in group {} but missing from fields()",
+                            current_tag.get(),
+                            group_def.number_of_entries_tag().get()
+                        ))
+                    })?;
+                if position < next_declared_idx {
+                    return Err(ParserError::InvalidGroupFieldOrder {
+                        tag: current_tag.get(),
+                        group_tag: group_def.number_of_entries_tag().get(),
+                    });
+                }
+                next_declared_idx = position + 1;
+
+                let group = current_group.as_mut().ok_or_else(|| {
+                    ParserError::Malformed(format!(
+                        "no group started before field {} in group {}",
+                        current_tag.get(),
+                        group_def.number_of_entries_tag().get()
+                    ))
+                })?;
+                group.store_field(field);
+
+                field = if let Some(nested_group_def) = group_def.get_nested_group(current_tag) {
+                    let (nested_groups, next) = self.parse_groups(
+                        parser,
+                        nested_group_def,
+                        current_tag,
+                        ParentScope::Group(group_def),
+                    )?;
+                    group.set_groups(nested_groups).map_err(|err| {
+                        ParserError::Malformed(format!(
+                            "failed to set nested groups for tag {}: {err}",
+                            current_tag.get()
+                        ))
+                    })?;
+                    next
                 } else {
-                    // the next field in the group is required but the next field in the message isn't it
-                    let err = if group_def.contains_tag(field.tag) {
-                        ParserError::InvalidGroupFieldOrder {
-                            tag: field.tag.get(),
-                            group_tag: group_def.number_of_entries_tag().get(),
-                        }
-                    } else {
-                        ParserError::InvalidField(field.tag.get())
-                    };
-                    return Err(err);
+                    parser
+                        .next_field()
+                        .ok_or(ParserError::Malformed("incomplete group".to_string()))?
+                };
+            } else if Self::parent_contains_tag(parent, current_tag)
+                || self.is_trailer_tag(current_tag)
+            {
+                // tag belongs to the enclosing scope (or is a trailer field), so
+                // close the current group and hand the field back to the caller
+                if let Some(g) = current_group.take() {
+                    groups.push(g);
+                }
+                return Ok((groups, field));
+            } else if self.should_accept_unknown_user_defined(current_tag) {
+                let group = current_group.as_mut().ok_or_else(|| {
+                    ParserError::Malformed(format!(
+                        "no group started before unknown user-defined field {} in group {}",
+                        current_tag.get(),
+                        group_def.number_of_entries_tag().get()
+                    ))
+                })?;
+                group.store_field(field);
+                field = parser
+                    .next_field()
+                    .ok_or(ParserError::Malformed("incomplete group".to_string()))?;
+            } else {
+                return Err(ParserError::InvalidField(current_tag.get()));
+            }
+        }
+    }
+
+    fn parent_contains_tag(parent: ParentScope<'_>, tag: TagU32) -> bool {
+        match parent {
+            ParentScope::Message(message_def) => message_def.contains_tag(tag),
+            ParentScope::Group(group_def) => group_def.contains_tag(tag),
+        }
+    }
+
+    fn check_required_fields_in_groups(
+        groups: &[RepeatingGroup],
+        group_def: &GroupSpecification,
+    ) -> ParserResult<()> {
+        let group_tag = group_def.number_of_entries_tag().get();
+        for entry in groups {
+            let field_map = entry.get_fields();
+
+            for field_def in group_def.fields() {
+                if field_def.is_required && !field_map.fields.contains_key(&field_def.tag) {
+                    return Err(ParserError::RequiredFieldMissing {
+                        tag: field_def.tag.get(),
+                        group_tag: Some(group_tag),
+                    });
                 }
             }
 
-            // we've checked all fields for this group,
-            // it's either another group in the repeating group or the end of the repeating group
-            groups.push(group);
-
-            if !group_def.contains_tag(field.tag) {
-                return Ok((groups, field));
+            for (nested_tag, nested_spec) in &group_def.nested_groups {
+                if let Some(nested_entries) = field_map.groups.get(nested_tag) {
+                    Self::check_required_fields_in_groups(nested_entries, nested_spec)?;
+                }
             }
         }
+        Ok(())
     }
 
     fn get_dict_field_by_tag(&self, tag: u32) -> ParserResult<hotfix_dictionary::Field<'_>> {
@@ -407,6 +522,10 @@ fn parser_error_to_parsed_message(err: ParserError, header: Header) -> ParsedMes
             reason: InvalidReason::InvalidMsgType(msg_type),
             message: Message::with_header(header),
         },
+        ParserError::RequiredFieldMissing { tag, group_tag } => ParsedMessage::Invalid {
+            reason: InvalidReason::RequiredFieldMissing { tag, group_tag },
+            message: Message::with_header(header),
+        },
         ParserError::Malformed(_) => ParsedMessage::Garbled(GarbledReason::Malformed),
     }
 }
@@ -414,6 +533,18 @@ fn parser_error_to_parsed_message(err: ParserError, header: Header) -> ParsedMes
 struct FieldSpecification {
     pub(crate) tag: TagU32,
     pub(crate) is_required: bool,
+}
+
+/// The enclosing scope of a repeating-group parse.
+///
+/// When a tag is encountered that does not belong to the group currently being
+/// parsed, the parser uses the parent scope to decide whether the tag closes
+/// the group (because it is recognised by the enclosing scope) or whether it
+/// should be treated as part of the current group / rejected.
+#[derive(Clone, Copy)]
+enum ParentScope<'a> {
+    Message(&'a MessageSpecification),
+    Group(&'a GroupSpecification),
 }
 
 struct GroupSpecification {
@@ -871,5 +1002,252 @@ mod tests {
         assert_eq!(alloc_2.get::<&str>(fix44::ALLOC_ACCOUNT).unwrap(), "ACC002");
         assert_eq!(alloc_2.get::<f64>(fix44::COMMISSION).unwrap(), 75.0);
         assert_eq!(alloc_2.get::<&str>(fix44::COMM_TYPE).unwrap(), "2");
+    }
+
+    const CONFIG_NO_USER_VALIDATION: Config =
+        Config::with_separator(b'|').validate_user_defined_fields(false);
+
+    fn build_pipe_separated_message(content: &str) -> Vec<u8> {
+        let body_length = content.len();
+        let prefix = format!("8=FIX.4.4|9={body_length}|{content}");
+        let checksum: u8 = prefix.bytes().fold(0u8, |acc, x| acc.wrapping_add(x));
+        format!("{prefix}10={checksum:03}|").into_bytes()
+    }
+
+    #[test]
+    fn test_unknown_user_defined_tag_at_body_rejected_by_default() {
+        let raw =
+            build_pipe_separated_message("35=D|49=SENDER|56=TARGET|55=AAPL|59=0|20000=custom|");
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG).unwrap();
+        let parsed = builder.build(&raw);
+
+        assert!(matches!(
+            parsed,
+            ParsedMessage::Invalid {
+                reason: InvalidReason::InvalidField(20000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_unknown_user_defined_tag_at_body_accepted_when_validation_disabled() {
+        let raw =
+            build_pipe_separated_message("35=D|49=SENDER|56=TARGET|55=AAPL|59=0|20000=custom|");
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG_NO_USER_VALIDATION).unwrap();
+        let message = builder.build(&raw).into_message().unwrap();
+
+        let custom_tag = TagU32::new(20000).unwrap();
+        let custom_value = message.get_field_map().get_raw(custom_tag).unwrap();
+        assert_eq!(custom_value, b"custom");
+
+        // Known fields should still be reachable.
+        assert_eq!(message.get::<&str>(fix44::SYMBOL).unwrap(), "AAPL");
+    }
+
+    #[test]
+    fn test_unknown_user_defined_tag_inside_group_stays_in_group_when_validation_disabled() {
+        let raw = build_pipe_separated_message(
+            "35=D|49=SENDER|56=TARGET|453=1|448=PARTYA|447=D|452=1|20000=custom|55=AAPL|",
+        );
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG_NO_USER_VALIDATION).unwrap();
+        let message = builder.build(&raw).into_message().unwrap();
+
+        // 20000 doesn't belong to the parent message and isn't a
+        // trailer field, so with user-defined validation disabled it stays
+        // inside the current group rather than leaking to the body.
+        let party = message.get_group(fix44::NO_PARTY_I_DS, 0).unwrap();
+        assert_eq!(party.get::<&str>(fix44::PARTY_ID).unwrap(), "PARTYA");
+        assert!(message.get_group(fix44::NO_PARTY_I_DS, 1).is_none());
+
+        let custom_tag = TagU32::new(20000).unwrap();
+        let in_group = party.get_field_map().get_raw(custom_tag).unwrap();
+        assert_eq!(in_group, b"custom");
+
+        // The body must NOT have picked up the unknown tag.
+        assert!(message.get_field_map().get_raw(custom_tag).is_none());
+
+        // Tag 55 belongs to NewOrderSingle, so it ends the group and lands on the body.
+        assert_eq!(message.get::<&str>(fix44::SYMBOL).unwrap(), "AAPL");
+    }
+
+    #[test]
+    fn test_unknown_user_defined_tag_inside_group_rejected_when_validation_enabled() {
+        let raw = build_pipe_separated_message(
+            "35=D|49=SENDER|56=TARGET|453=1|448=PARTYA|447=D|452=1|20000=custom|55=AAPL|",
+        );
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG).unwrap();
+        let parsed = builder.build(&raw);
+
+        assert!(matches!(
+            parsed,
+            ParsedMessage::Invalid {
+                reason: InvalidReason::InvalidField(20000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_unknown_user_defined_tag_inside_nested_group_stays_in_nested_group() {
+        // 20000 appears inside a NoPartySubIDs entry. NoPartySubIDs is the
+        // immediate parent (a Group) and doesn't contain 20000, so the field
+        // is kept inside the nested entry. The trailer (10) ends both the
+        // nested group and the outer NoPartyIDs group cleanly.
+        let raw = build_pipe_separated_message(
+            "35=D|49=SENDER|56=TARGET|453=1|448=PARTYA|447=D|452=1|802=1|523=SUB1|803=1|20000=custom|",
+        );
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG_NO_USER_VALIDATION).unwrap();
+        let message = builder.build(&raw).into_message().unwrap();
+
+        let party = message.get_group(fix44::NO_PARTY_I_DS, 0).unwrap();
+        let sub = party.get_group(fix44::NO_PARTY_SUB_I_DS.tag(), 0).unwrap();
+        assert_eq!(sub.get::<&str>(fix44::PARTY_SUB_ID).unwrap(), "SUB1");
+
+        let custom_tag = TagU32::new(20000).unwrap();
+        // 20000 lives inside the nested NoPartySubIDs entry...
+        let in_sub = sub.get_field_map().get_raw(custom_tag).unwrap();
+        assert_eq!(in_sub, b"custom");
+        // ...not on the outer NoPartyIDs entry...
+        assert!(party.get_field_map().get_raw(custom_tag).is_none());
+        // ...nor on the body.
+        assert!(message.get_field_map().get_raw(custom_tag).is_none());
+    }
+
+    #[test]
+    fn test_group_rejects_when_first_tag_is_not_delimiter() {
+        // 453 (NoPartyIDs) declares the count but the first tag after it is
+        // 20000 instead of the delimiter 448. This is a
+        // hard reject regardless of user-defined-field validation.
+        let raw = build_pipe_separated_message(
+            "35=D|49=SENDER|56=TARGET|453=1|20000=x|448=PARTYA|447=D|452=1|",
+        );
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG_NO_USER_VALIDATION).unwrap();
+        let parsed = builder.build(&raw);
+
+        assert!(matches!(
+            parsed,
+            ParsedMessage::Invalid {
+                reason: InvalidReason::InvalidOrderInGroup {
+                    tag: 20000,
+                    group_tag: 453,
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_known_outer_field_after_group_fields_ends_group() {
+        let raw = build_pipe_separated_message(
+            "35=D|49=SENDER|56=TARGET|453=1|448=PARTYA|447=D|452=1|55=AAPL|59=0|",
+        );
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG).unwrap();
+        let message = builder.build(&raw).into_message().unwrap();
+
+        let party = message.get_group(fix44::NO_PARTY_I_DS, 0).unwrap();
+        assert_eq!(party.get::<&str>(fix44::PARTY_ID).unwrap(), "PARTYA");
+        assert!(message.get_group(fix44::NO_PARTY_I_DS, 1).is_none());
+
+        // Symbol must not have been pulled into the group.
+        assert!(party.get_raw(fix44::SYMBOL).is_none());
+        assert_eq!(message.get::<&str>(fix44::SYMBOL).unwrap(), "AAPL");
+        assert_eq!(message.get::<&str>(fix44::TIME_IN_FORCE).unwrap(), "0");
+    }
+
+    #[test]
+    fn test_fields_declared_in_group_still_parsed_inside_when_validation_disabled() {
+        // Same nested-group payload as `nested_repeating_group_entries`, but with
+        // user-defined-field validation disabled. Tags that *are* declared inside
+        // the group dictionary (including nested NoPartySubIDs) must still be
+        // placed inside the group rather than leaking to the body.
+        let raw = b"8=FIX.4.4|9=247|35=8|34=2|49=Broker|52=20231103-09:30:00|56=Client|11=Order12345|17=Exec12345|150=0|39=0|55=APPL|54=1|38=100|32=50|31=150.00|151=50|14=50|6=150.00|453=2|448=PARTYA|447=D|452=1|802=2|523=SUBPARTYA1|803=1|523=SUBPARTYA2|803=2|448=PARTYB|447=D|452=2|10=129|";
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG_NO_USER_VALIDATION).unwrap();
+        let message = builder.build(raw).into_message().unwrap();
+
+        let party_a = message.get_group(fix44::NO_PARTY_I_DS, 0).unwrap();
+        let sub = party_a
+            .get_group(fix44::NO_PARTY_SUB_I_DS.tag(), 0)
+            .unwrap();
+        assert_eq!(sub.get::<&str>(fix44::PARTY_SUB_ID).unwrap(), "SUBPARTYA1");
+
+        let party_b = message.get_group(fix44::NO_PARTY_I_DS, 1).unwrap();
+        assert_eq!(party_b.get::<&str>(fix44::PARTY_ID).unwrap(), "PARTYB");
+    }
+
+    #[test]
+    fn test_group_entry_missing_required_field_is_rejected() {
+        let dict = Dictionary::fix44();
+        let builder = MessageBuilder::new(dict, CONFIG).unwrap();
+
+        // Find any (msg_type, group, required-non-delim-field) combination so
+        // we can construct a minimal message that's structurally well-formed
+        // except for the missing group field.
+        let candidate = builder
+            .message_specification
+            .iter()
+            .find_map(|(msg_type, message_def)| {
+                message_def
+                    .groups
+                    .iter()
+                    .find_map(|(group_tag, group_spec)| {
+                        let required_non_delim = group_spec
+                            .fields()
+                            .iter()
+                            .find(|f| f.is_required && f.tag != group_spec.delimiter_tag())?;
+                        Some((
+                            msg_type.clone(),
+                            group_tag.get(),
+                            group_spec.delimiter_tag().get(),
+                            required_non_delim.tag.get(),
+                        ))
+                    })
+            });
+
+        let Some((msg_type, group_tag, delimiter_tag, missing_tag)) = candidate else {
+            // The dictionary has no group with a required non-delimiter field.
+            return;
+        };
+
+        let body = format!(
+            "35={msg_type}|49=S|56=T|34=1|52=20231103-12:00:00|{group_tag}=1|{delimiter_tag}=X|"
+        );
+        let raw = build_pipe_separated_message(&body);
+        let parsed = builder.build(&raw);
+
+        match parsed {
+            ParsedMessage::Invalid {
+                reason:
+                    InvalidReason::RequiredFieldMissing {
+                        tag,
+                        group_tag: Some(g),
+                    },
+                ..
+            } => {
+                assert_eq!(tag, missing_tag);
+                assert_eq!(g, group_tag);
+            }
+            other => panic!(
+                "expected RequiredFieldMissing(tag={missing_tag}, group_tag={group_tag}); \
+                 msg_type={msg_type}, delimiter={delimiter_tag}, got: {}",
+                match &other {
+                    ParsedMessage::Valid(_) => "Valid".to_string(),
+                    ParsedMessage::Invalid { reason, .. } => match reason {
+                        InvalidReason::InvalidField(t) => format!("InvalidField({t})"),
+                        InvalidReason::InvalidGroup(t) => format!("InvalidGroup({t})"),
+                        InvalidReason::InvalidOrderInGroup { tag, group_tag } => {
+                            format!("InvalidOrderInGroup(tag={tag}, group_tag={group_tag})")
+                        }
+                        InvalidReason::InvalidComponent(s) => format!("InvalidComponent({s})"),
+                        InvalidReason::InvalidMsgType(s) => format!("InvalidMsgType({s})"),
+                        InvalidReason::RequiredFieldMissing { tag, group_tag } => {
+                            format!("RequiredFieldMissing(tag={tag}, group_tag={group_tag:?})")
+                        }
+                    },
+                    ParsedMessage::Garbled(_) => "Garbled".to_string(),
+                    ParsedMessage::UnexpectedError(_) => "UnexpectedError".to_string(),
+                }
+            ),
+        }
     }
 }
