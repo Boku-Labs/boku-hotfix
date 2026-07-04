@@ -208,12 +208,8 @@ impl MessageBuilder {
                 let field_def = self.get_dict_field_by_tag(tag.get())?;
                 match message_def.get_group(tag) {
                     Some(group_def) => {
-                        let (groups, next) = self.parse_groups(
-                            parser,
-                            group_def,
-                            field_def.tag(),
-                            ParentScope::Message(message_def),
-                        )?;
+                        let (groups, next) =
+                            self.parse_groups(parser, group_def, field_def.tag())?;
                         Self::check_required_fields_in_groups(&groups, group_def)?;
                         body.set_groups(groups).map_err(|err| {
                             ParserError::Malformed(format!(
@@ -247,7 +243,9 @@ impl MessageBuilder {
     }
 
     fn should_accept_unknown_user_defined(&self, tag: TagU32) -> bool {
-        !self.config.validate_user_defined_fields && Self::is_user_defined(tag)
+        !self.config.validate_user_defined_fields
+            && Self::is_user_defined(tag)
+            && self.dict.field_by_tag(tag.get()).is_none()
     }
 
     fn is_user_defined(tag: TagU32) -> bool {
@@ -270,7 +268,6 @@ impl MessageBuilder {
         parser: &mut Parser,
         group_def: &GroupSpecification,
         start_tag: TagU32,
-        parent: ParentScope<'_>,
     ) -> ParserResult<(Vec<RepeatingGroup>, Field)> {
         let mut groups = vec![];
         let delimiter_tag = group_def.delimiter_tag();
@@ -335,12 +332,8 @@ impl MessageBuilder {
                 group.store_field(field);
 
                 field = if let Some(nested_group_def) = group_def.get_nested_group(current_tag) {
-                    let (nested_groups, next) = self.parse_groups(
-                        parser,
-                        nested_group_def,
-                        current_tag,
-                        ParentScope::Group(group_def),
-                    )?;
+                    let (nested_groups, next) =
+                        self.parse_groups(parser, nested_group_def, current_tag)?;
                     group.set_groups(nested_groups).map_err(|err| {
                         ParserError::Malformed(format!(
                             "failed to set nested groups for tag {}: {err}",
@@ -353,15 +346,6 @@ impl MessageBuilder {
                         .next_field()
                         .ok_or(ParserError::Malformed("incomplete group".to_string()))?
                 };
-            } else if Self::parent_contains_tag(parent, current_tag)
-                || self.is_trailer_tag(current_tag)
-            {
-                // tag belongs to the enclosing scope (or is a trailer field), so
-                // close the current group and hand the field back to the caller
-                if let Some(g) = current_group.take() {
-                    groups.push(g);
-                }
-                return Ok((groups, field));
             } else if self.should_accept_unknown_user_defined(current_tag) {
                 let group = current_group.as_mut().ok_or_else(|| {
                     ParserError::Malformed(format!(
@@ -375,15 +359,11 @@ impl MessageBuilder {
                     .next_field()
                     .ok_or(ParserError::Malformed("incomplete group".to_string()))?;
             } else {
-                return Err(ParserError::InvalidField(current_tag.get()));
+                if let Some(g) = current_group.take() {
+                    groups.push(g);
+                }
+                return Ok((groups, field));
             }
-        }
-    }
-
-    fn parent_contains_tag(parent: ParentScope<'_>, tag: TagU32) -> bool {
-        match parent {
-            ParentScope::Message(message_def) => message_def.contains_tag(tag),
-            ParentScope::Group(group_def) => group_def.contains_tag(tag),
         }
     }
 
@@ -533,12 +513,6 @@ fn parser_error_to_parsed_message(err: ParserError, header: Header) -> ParsedMes
 struct FieldSpecification {
     pub(crate) tag: TagU32,
     pub(crate) is_required: bool,
-}
-
-#[derive(Clone, Copy)]
-enum ParentScope<'a> {
-    Message(&'a MessageSpecification),
-    Group(&'a GroupSpecification),
 }
 
 struct GroupSpecification {
@@ -1147,6 +1121,145 @@ mod tests {
         assert!(party.get_raw(fix44::SYMBOL).is_none());
         assert_eq!(message.get::<&str>(fix44::SYMBOL).unwrap(), "AAPL");
         assert_eq!(message.get::<&str>(fix44::TIME_IN_FORCE).unwrap(), "0");
+    }
+
+    #[test]
+    fn test_nested_and_outer_group_end_on_body_field() {
+        let raw = build_pipe_separated_message(
+            "35=D|49=SENDER|56=TARGET|453=1|448=PARTYA|447=D|452=1|802=1|523=SUB1|803=1|55=AAPL|59=0|",
+        );
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG).unwrap();
+        let message = builder.build(&raw).into_message().unwrap();
+
+        let party = message.get_group(fix44::NO_PARTY_I_DS, 0).unwrap();
+        let sub = party.get_group(fix44::NO_PARTY_SUB_I_DS.tag(), 0).unwrap();
+        assert_eq!(sub.get::<&str>(fix44::PARTY_SUB_ID).unwrap(), "SUB1");
+
+        assert_eq!(message.get::<&str>(fix44::SYMBOL).unwrap(), "AAPL");
+        assert_eq!(message.get::<&str>(fix44::TIME_IN_FORCE).unwrap(), "0");
+    }
+
+    #[test]
+    fn test_declared_group_field_out_of_order_is_rejected() {
+        let raw =
+            build_pipe_separated_message("35=D|49=SENDER|56=TARGET|453=1|448=PARTYA|452=1|447=D|");
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG).unwrap();
+        let parsed = builder.build(&raw);
+
+        assert!(matches!(
+            parsed,
+            ParsedMessage::Invalid {
+                reason: InvalidReason::InvalidOrderInGroup {
+                    tag: 447,
+                    group_tag: 453,
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_multiple_nested_group_instances_are_parsed() {
+        let raw = build_pipe_separated_message(
+            "35=D|49=SENDER|56=TARGET|453=1|448=PARTYA|447=D|452=1|802=2|523=SUB1|803=1|523=SUB2|803=2|55=AAPL|",
+        );
+        let builder = MessageBuilder::new(Dictionary::fix44(), CONFIG).unwrap();
+        let message = builder.build(&raw).into_message().unwrap();
+
+        let party = message.get_group(fix44::NO_PARTY_I_DS, 0).unwrap();
+        let sub0 = party.get_group(fix44::NO_PARTY_SUB_I_DS.tag(), 0).unwrap();
+        let sub1 = party.get_group(fix44::NO_PARTY_SUB_I_DS.tag(), 1).unwrap();
+        assert_eq!(sub0.get::<&str>(fix44::PARTY_SUB_ID).unwrap(), "SUB1");
+        assert_eq!(sub1.get::<&str>(fix44::PARTY_SUB_ID).unwrap(), "SUB2");
+        assert!(party.get_group(fix44::NO_PARTY_SUB_I_DS.tag(), 2).is_none());
+
+        assert_eq!(message.get::<&str>(fix44::SYMBOL).unwrap(), "AAPL");
+    }
+
+    const NESTED_REQUIRED_SPEC: &str = r#"<fix type='FIX' major='4' minor='4' servicepack='0'>
+ <header>
+  <field name='BeginString' required='Y'/>
+  <field name='BodyLength' required='Y'/>
+  <field name='MsgType' required='Y'/>
+  <field name='SenderCompID' required='Y'/>
+  <field name='TargetCompID' required='Y'/>
+  <field name='MsgSeqNum' required='Y'/>
+  <field name='SendingTime' required='Y'/>
+ </header>
+ <trailer>
+  <field name='CheckSum' required='Y'/>
+ </trailer>
+ <messages>
+  <message name='NestedReqMsg' msgtype='U1' msgcat='app'>
+   <group name='NoOuter' required='N'>
+    <field name='OuterDelim' required='N'/>
+    <group name='NoInner' required='N'>
+     <field name='InnerDelim' required='N'/>
+     <field name='InnerRequired' required='Y'/>
+    </group>
+   </group>
+   <field name='CustomBody' required='N'/>
+  </message>
+ </messages>
+ <components>
+ </components>
+ <fields>
+  <field number='8' name='BeginString' type='STRING'/>
+  <field number='9' name='BodyLength' type='LENGTH'/>
+  <field number='35' name='MsgType' type='STRING'/>
+  <field number='49' name='SenderCompID' type='STRING'/>
+  <field number='56' name='TargetCompID' type='STRING'/>
+  <field number='34' name='MsgSeqNum' type='SEQNUM'/>
+  <field number='52' name='SendingTime' type='UTCTIMESTAMP'/>
+  <field number='10' name='CheckSum' type='STRING'/>
+  <field number='6001' name='NoOuter' type='NUMINGROUP'/>
+  <field number='6002' name='OuterDelim' type='STRING'/>
+  <field number='6003' name='NoInner' type='NUMINGROUP'/>
+  <field number='6004' name='InnerDelim' type='STRING'/>
+  <field number='6005' name='InnerRequired' type='STRING'/>
+  <field number='5100' name='CustomBody' type='STRING'/>
+ </fields>
+</fix>"#;
+
+    #[test]
+    fn test_declared_user_defined_body_field_ends_group_when_validation_disabled() {
+        let dict = Dictionary::from_quickfix_spec(NESTED_REQUIRED_SPEC).unwrap();
+        let raw = build_pipe_separated_message(
+            "35=U1|49=S|56=T|34=1|52=20231103-12:00:00|6001=1|6002=od|6003=1|6004=id|6005=req|5100=v|",
+        );
+        let builder = MessageBuilder::new(dict, CONFIG_NO_USER_VALIDATION).unwrap();
+        let message = builder.build(&raw).into_message().unwrap();
+
+        let custom_tag = TagU32::new(5100).unwrap();
+        let outer_tag = TagU32::new(6001).unwrap();
+        let inner_tag = TagU32::new(6003).unwrap();
+
+        let outer = message.get_field_map().get_group(outer_tag, 0).unwrap();
+        let inner = outer.get_group(inner_tag, 0).unwrap();
+        assert!(inner.get_field_map().get_raw(custom_tag).is_none());
+        assert!(outer.get_field_map().get_raw(custom_tag).is_none());
+        assert_eq!(message.get_field_map().get_raw(custom_tag).unwrap(), b"v");
+    }
+
+    #[test]
+    fn test_required_field_missing_in_nested_group() {
+        let dict = Dictionary::from_quickfix_spec(NESTED_REQUIRED_SPEC).unwrap();
+        let raw = build_pipe_separated_message(
+            "35=U1|49=S|56=T|34=1|52=20231103-12:00:00|6001=1|6002=od|6003=1|6004=id|",
+        );
+        let builder = MessageBuilder::new(dict, CONFIG).unwrap();
+        let parsed = builder.build(&raw);
+
+        assert!(matches!(
+            parsed,
+            ParsedMessage::Invalid {
+                reason: InvalidReason::RequiredFieldMissing {
+                    tag: 6005,
+                    group_tag: Some(6003),
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
