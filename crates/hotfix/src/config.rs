@@ -185,7 +185,9 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{Config, ConfigError, TlsConfig};
+    use crate::config::{
+        Config, ConfigError, TlsConfig, ValidationConfig, VerificationConfigBuilder,
+    };
     use chrono::{NaiveTime, Weekday};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -534,6 +536,47 @@ validate_user_defined_fields = false
         let session_config = config.sessions.first().unwrap();
 
         assert!(!session_config.validation.validate_user_defined_fields);
+    }
+
+    #[test]
+    fn test_validation_config_builder_produces_default() {
+        let config = ValidationConfig::builder().build();
+        assert!(config.validate_user_defined_fields);
+    }
+
+    #[test]
+    fn test_verification_config_builder_new_and_override() {
+        let enabled = VerificationConfigBuilder::new().build();
+        assert!(enabled.validate_user_defined_fields);
+
+        let disabled = VerificationConfigBuilder::new()
+            .validate_user_defined_fields(false)
+            .build();
+        assert!(!disabled.validate_user_defined_fields);
+    }
+
+    #[test]
+    fn test_validation_field_default_when_section_present_but_field_omitted() {
+        let config_contents = r#"
+[[sessions]]
+begin_string = "FIX.4.4"
+sender_comp_id = "send-comp-id"
+target_comp_id = "target-comp-id"
+connection_port = 443
+connection_host = "127.0.0.1"
+heartbeat_interval = 30
+
+[sessions.validation]
+        "#;
+
+        let config: Config = toml::from_str(config_contents).unwrap();
+        let session_config = config.sessions.first().unwrap();
+
+        // The [sessions.validation] table is present but omits the field, so the
+        // field-level serde default (`default_true`) supplies the value, unlike
+        // `test_verification_config_defaults_when_omitted` where the whole table
+        // is absent and `ValidationConfig::default()` is used instead.
+        assert!(session_config.validation.validate_user_defined_fields);
     }
 
     #[test]

@@ -303,17 +303,12 @@ impl MessageBuilder {
                     .ok_or(ParserError::Malformed("incomplete group".to_string()))?;
             } else if group_def.contains_tag(current_tag) {
                 // tag is declared in this group; enforce declaration order
+                #[allow(clippy::expect_used)]
                 let position = group_def
                     .fields()
                     .iter()
                     .position(|f| f.tag == current_tag)
-                    .ok_or_else(|| {
-                        ParserError::Malformed(format!(
-                            "field {} reported as in group {} but missing from fields()",
-                            current_tag.get(),
-                            group_def.number_of_entries_tag().get()
-                        ))
-                    })?;
+                    .expect("contains_tag guarantees the tag is present in fields()");
                 if position < next_declared_idx {
                     return Err(ParserError::InvalidGroupFieldOrder {
                         tag: current_tag.get(),
@@ -322,24 +317,19 @@ impl MessageBuilder {
                 }
                 next_declared_idx = position + 1;
 
-                let group = current_group.as_mut().ok_or_else(|| {
-                    ParserError::Malformed(format!(
-                        "no group started before field {} in group {}",
-                        current_tag.get(),
-                        group_def.number_of_entries_tag().get()
-                    ))
-                })?;
+                #[allow(clippy::expect_used)]
+                let group = current_group
+                    .as_mut()
+                    .expect("the delimiter opens a group before any declared field is seen");
                 group.store_field(field);
 
                 field = if let Some(nested_group_def) = group_def.get_nested_group(current_tag) {
                     let (nested_groups, next) =
                         self.parse_groups(parser, nested_group_def, current_tag)?;
-                    group.set_groups(nested_groups).map_err(|err| {
-                        ParserError::Malformed(format!(
-                            "failed to set nested groups for tag {}: {err}",
-                            current_tag.get()
-                        ))
-                    })?;
+                    #[allow(clippy::expect_used)]
+                    group.set_groups(nested_groups).expect(
+                        "parse_groups yields a non-empty run of entries sharing one start and delimiter tag",
+                    );
                     next
                 } else {
                     parser
@@ -347,13 +337,10 @@ impl MessageBuilder {
                         .ok_or(ParserError::Malformed("incomplete group".to_string()))?
                 };
             } else if self.should_accept_unknown_user_defined(current_tag) {
-                let group = current_group.as_mut().ok_or_else(|| {
-                    ParserError::Malformed(format!(
-                        "no group started before unknown user-defined field {} in group {}",
-                        current_tag.get(),
-                        group_def.number_of_entries_tag().get()
-                    ))
-                })?;
+                #[allow(clippy::expect_used)]
+                let group = current_group
+                    .as_mut()
+                    .expect("the delimiter opens a group before any user-defined field is seen");
                 group.store_field(field);
                 field = parser
                     .next_field()
