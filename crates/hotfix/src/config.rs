@@ -129,22 +129,22 @@ pub struct ValidationConfig {
 }
 
 impl ValidationConfig {
-    pub fn builder() -> VerificationConfigBuilder {
-        VerificationConfigBuilder::default()
+    pub fn builder() -> ValidationConfigBuilder {
+        ValidationConfigBuilder::default()
     }
 }
 
 impl Default for ValidationConfig {
     fn default() -> Self {
-        VerificationConfigBuilder::default().build()
+        ValidationConfigBuilder::default().build()
     }
 }
 
-pub struct VerificationConfigBuilder {
+pub struct ValidationConfigBuilder {
     validate_user_defined_fields: bool,
 }
 
-impl Default for VerificationConfigBuilder {
+impl Default for ValidationConfigBuilder {
     fn default() -> Self {
         Self {
             validate_user_defined_fields: true,
@@ -152,7 +152,7 @@ impl Default for VerificationConfigBuilder {
     }
 }
 
-impl VerificationConfigBuilder {
+impl ValidationConfigBuilder {
     pub fn new() -> Self {
         Self::default()
     }
@@ -186,7 +186,7 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        Config, ConfigError, TlsConfig, ValidationConfig, VerificationConfigBuilder,
+        Config, ConfigError, TlsConfig, ValidationConfig, ValidationConfigBuilder,
     };
     use chrono::{NaiveTime, Weekday};
     use std::io::Write;
@@ -546,10 +546,10 @@ validate_user_defined_fields = false
 
     #[test]
     fn test_verification_config_builder_new_and_override() {
-        let enabled = VerificationConfigBuilder::new().build();
+        let enabled = ValidationConfigBuilder::new().build();
         assert!(enabled.validate_user_defined_fields);
 
-        let disabled = VerificationConfigBuilder::new()
+        let disabled = ValidationConfigBuilder::new()
             .validate_user_defined_fields(false)
             .build();
         assert!(!disabled.validate_user_defined_fields);
